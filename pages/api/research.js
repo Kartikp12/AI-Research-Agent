@@ -1,150 +1,90 @@
 import { searchWeb } from "../../lib/search";
 import { processSources } from "../../lib/source-quality";
 
-export default async function handler(req, res) {
-  if (req.method !== "POST") {
-    return res.status(405).json({
-      error: "Method not allowed",
-    });
+const OLLAMA_URL = "http://127.0.0.1:11434/api/generate";
+const MODEL = "qwen3:4b";
+
+/* -----------------------------
+   Ollama Helper
+----------------------------- */
+
+async function askOllama(prompt, numPredict) {
+  const response = await fetch(OLLAMA_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: MODEL,
+      prompt,
+      stream: false,
+      format: "json",
+      think: false,
+      options: {
+        num_predict: numPredict,
+      },
+    }),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(
+      errorText || "Ollama request failed"
+    );
   }
 
+  const data = await response.json();
+
+  if (!data.response) {
+    console.error("Empty Ollama response:", data);
+    throw new Error("Ollama returned an empty response");
+  }
+
+  const rawResponse = data.response.trim();
+
   try {
-    const { question } = req.body;
-
-    if (!question || !question.trim()) {
-      return res.status(400).json({
-        error: "Research question is required",
-      });
-    }
-
-    // ==================================================
-    // 1. RESEARCH PLANNER
-    // ==================================================
-
-    const planningPrompt = `
-You are a research planning system.
-
-User research question:
-${question}
-
-Break this question into 2 to 5 focused research sub-questions.
-
-Rules:
-- Cover the important aspects of the original question.
-- Each sub-question should investigate a different aspect.
-- Keep questions concise.
-- Do not answer the questions.
-- Return ONLY valid JSON.
-
-Required format:
-{
-  "subQuestions": [
-    "question 1",
-    "question 2",
-    "question 3"
-  ]
-}
-`;
-
-    const planningResponse = await fetch(
-      "http://127.0.0.1:11434/api/generate",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          model: "qwen3:4b",
-          prompt: planningPrompt,
-          stream: false,
-          format: "json",
-          think: false,
-          options: {
-            num_predict: 120,
-          },
-        }),
-      }
+    return JSON.parse(rawResponse);
+  } catch (error) {
+    console.error(
+      "Invalid Ollama JSON:",
+      rawResponse
     );
 
-    if (!planningResponse.ok) {
-      const errorText = await planningResponse.text();
+    // Try extracting JSON object if extra text was returned
+    const start = rawResponse.indexOf("{");
+    const end = rawResponse.lastIndexOf("}");
 
-      return res.status(500).json({
-        error: "Research planning failed",
-        details: errorText,
-      });
-    }
+    if (start !== -1 && end !== -1 && end > start) {
+      const possibleJson = rawResponse.slice(
+        start,
+        end + 1
+      );
 
-    const planningData = await planningResponse.json();
-
-    let plan;
-
-    try {
-      plan = JSON.parse(planningData.response);
-    } catch (error) {
-      return res.status(500).json({
-        error: "Invalid planner JSON",
-        rawResponse: planningData.response,
-      });
-    }
-
-    const subQuestions = Array.isArray(plan.subQuestions)
-      ? plan.subQuestions
-      : [];
-
-    if (!subQuestions.length) {
-      return res.status(500).json({
-        error: "Planner returned no sub-questions",
-      });
-    }
-
-    // ==================================================
-    // 2. WEB RESEARCH
-    // ==================================================
-
-    const researchResults = [];
-
-    for (const subQuestion of subQuestions) {
-      if (!subQuestion || !subQuestion.trim()) {
-        continue;
+      try {
+        return JSON.parse(possibleJson);
+      } catch {
+        // Continue to final error
       }
-
-      console.log(`Searching: ${subQuestion}`);
-
-      const rawSources = await searchWeb(subQuestion);
-      const sources = processSources(rawSources);
-
-      researchResults.push({
-        subQuestion,
-        sources,
-      });
     }
 
-    // ==================================================
-    // 3. CLAIM EXTRACTION + MULTI-SOURCE VERIFICATION
-    // ==================================================
+    throw new Error(
+      "Invalid Ollama JSON response"
+    );
+  }
+}
 
-    const findings = [];
+/* -----------------------------
+   Claim Extraction
+----------------------------- */
 
-    for (const researchItem of researchResults) {
-      const subQuestion = researchItem.subQuestion;
-
-      const sources = Array.isArray(researchItem.sources)
-        ? researchItem.sources
-        : [];
-
-      if (!subQuestion || !sources.length) {
-        continue;
-      }
-
-      // ------------------------------------------------
-      // Build compact source context
-      // ------------------------------------------------
-
-      const sourceContext = sources
-        .slice(0, 3)
-        .map((source) => {
-          return `
+async function extractClaims(
+  subQuestion,
+  sources
+) {
+  const sourceContext = sources
+    .slice(0, 3)
+    .map(
+      (source) => `
 SOURCE [${source.id}]
 Title: ${source.title}
 Domain: ${source.domain || ""}
@@ -152,15 +92,11 @@ Quality: ${source.sourceQuality || "medium"}
 
 Content:
 ${source.content?.slice(0, 700) || ""}
-`;
-        })
-        .join("\n-----------------\n");
+`
+    )
+    .join("\n-----------------\n");
 
-      // ------------------------------------------------
-      // Extract claims
-      // ------------------------------------------------
-
-      const extractionPrompt = `
+  const prompt = `
 You are an evidence extraction system.
 
 Research sub-question:
@@ -169,18 +105,17 @@ ${subQuestion}
 Sources:
 ${sourceContext}
 
-Extract up to 2 important factual claims that directly help answer the research sub-question.
+Extract up to 2 important factual claims that directly help answer the question.
 
 Rules:
 - Use ONLY the provided sources.
 - Do not use outside knowledge.
 - Do not invent facts.
 - Maximum 2 claims.
-- Keep each claim under 12 words.
-- Keep each evidence under 18 words.
-- sourceId must identify the source supporting the claim.
+- Claim under 12 words.
+- Evidence under 18 words.
+- sourceId must match the source ID.
 - Return ONLY valid JSON.
-- Keep the JSON response very short.
 
 Required JSON:
 {
@@ -194,86 +129,41 @@ Required JSON:
 }
 `;
 
-      const extractionResponse = await fetch(
-        "http://127.0.0.1:11434/api/generate",
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            model: "qwen3:4b",
-            prompt: extractionPrompt,
-            stream: false,
-            format: "json",
-            think: false,
-            options: {
-              num_predict: 160,
-            },
-          }),
-        }
-      );
+  const result = await askOllama(
+    prompt,
+    150
+  );
 
-      if (!extractionResponse.ok) {
-        const errorText = await extractionResponse.text();
+  return Array.isArray(result.claims)
+    ? result.claims
+    : [];
+}
 
-        return res.status(500).json({
-          error: "Evidence extraction failed",
-          details: errorText,
-        });
-      }
+/* -----------------------------
+   Claim Verification
+----------------------------- */
 
-      const extractionData = await extractionResponse.json();
-
-      console.log(
-        "Extraction response:",
-        extractionData.response
-      );
-
-      let extracted;
-
-      try {
-        extracted = JSON.parse(extractionData.response);
-      } catch (error) {
-        console.error(
-          "Invalid extraction JSON:",
-          extractionData.response
-        );
-
-        return res.status(500).json({
-          error: "Invalid extraction JSON",
-          rawResponse: extractionData.response,
-        });
-      }
-
-      const claims = Array.isArray(extracted.claims)
-        ? extracted.claims
-        : [];
-
-      // ------------------------------------------------
-      // Multi-source verification
-      // ------------------------------------------------
-
-      const verifiedClaims = [];
-
-      for (const claimItem of claims) {
-        const sourceContextForVerification = sources
-          .slice(0, 3)
-          .map((source, index) => {
-            return `
-SOURCE ${index + 1}
-Source ID: ${source.id}
+async function verifyClaim(
+  subQuestion,
+  claimItem,
+  sources
+) {
+  const sourceContext = sources
+    .slice(0, 5)
+    .map(
+      (source) => `
+SOURCE ${source.id}
 Title: ${source.title}
 Domain: ${source.domain || ""}
 Quality: ${source.sourceQuality || "medium"}
 
 Content:
 ${source.content?.slice(0, 500) || ""}
-`;
-          })
-          .join("\n-----------------\n");
+`
+    )
+    .join("\n-----------------\n");
 
-        const verificationPrompt = `
+  const prompt = `
 You are a multi-source evidence verification system.
 
 Research sub-question:
@@ -282,39 +172,29 @@ ${subQuestion}
 Claim:
 ${claimItem.claim}
 
-Evidence extracted from one source:
+Evidence:
 ${claimItem.evidence}
 
-Evaluate the claim against ALL provided sources.
+Sources:
+${sourceContext}
 
-${sourceContextForVerification}
+Evaluate the claim against the provided sources.
 
 Rules:
-- Use ONLY the provided sources.
+- Use ONLY provided sources.
 - Do not use outside knowledge.
-- Do not invent information.
-- Count sources that support the claim.
-- Count sources that contradict the claim.
-- A source should count as supporting only if its content provides direct or clear evidence.
-- Do not treat missing information as contradiction.
-- If multiple sources independently support the claim, confidence is stronger.
-- If sources disagree, use conflicting.
-- Keep the reason under 20 words.
+- Missing information is NOT contradiction.
+- Count supporting sources.
+- Count contradicting sources.
+- Keep reason under 20 words.
 - Return ONLY valid JSON.
 
-Allowed status values:
+Allowed statuses:
 - strongly_supported
 - supported
 - partially_supported
 - conflicting
 - insufficient_evidence
-
-Status guidance:
-- strongly_supported: 2 or more sources clearly support the claim and no source contradicts it.
-- supported: 1 source clearly supports the claim and no source contradicts it.
-- partially_supported: evidence supports only part of the claim.
-- conflicting: at least one source supports and another contradicts the claim.
-- insufficient_evidence: sources do not provide enough evidence.
 
 Required JSON:
 {
@@ -325,100 +205,542 @@ Required JSON:
 }
 `;
 
-        const verificationResponse = await fetch(
-          "http://127.0.0.1:11434/api/generate",
-          {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
-              model: "qwen3:4b",
-              prompt: verificationPrompt,
-              stream: false,
-              format: "json",
-              think: false,
-              options: {
-                num_predict: 120,
-              },
-            }),
-          }
-        );
+  return await askOllama(
+    prompt,
+    110
+  );
+}
 
-        if (!verificationResponse.ok) {
-          const errorText = await verificationResponse.text();
+/* -----------------------------
+   Lightweight Sufficiency
+   No Ollama call
+----------------------------- */
 
-          return res.status(500).json({
-            error: "Evidence verification failed",
-            details: errorText,
-          });
-        }
+function evaluateSufficiency(
+  verifiedClaims
+) {
+  if (!verifiedClaims.length) {
+    return {
+      sufficient: false,
+      reason:
+        "No verified claims were found.",
+    };
+  }
 
-        const verificationData =
-          await verificationResponse.json();
+  const hasConflict =
+    verifiedClaims.some(
+      (item) =>
+        item.verification.status ===
+        "conflicting"
+    );
 
-        console.log(
-          "Verification response:",
-          verificationData.response
-        );
+  if (hasConflict) {
+    return {
+      sufficient: false,
+      reason:
+        "Conflicting evidence was detected.",
+    };
+  }
 
-        let verification;
+  const hasWeakEvidence =
+    verifiedClaims.some(
+      (item) =>
+        item.verification.status ===
+          "insufficient_evidence" ||
+        item.verification.status ===
+          "partially_supported"
+    );
 
-        try {
-          verification = JSON.parse(
-            verificationData.response
-          );
-        } catch (error) {
-          console.error(
-            "Invalid verification JSON:",
-            verificationData.response
-          );
+  if (hasWeakEvidence) {
+    return {
+      sufficient: false,
+      reason:
+        "Some claims are not sufficiently supported.",
+    };
+  }
 
-          return res.status(500).json({
-            error: "Invalid verification JSON",
-            rawResponse: verificationData.response,
-          });
-        }
+  const strongClaims =
+    verifiedClaims.filter(
+      (item) =>
+        item.verification.status ===
+        "strongly_supported"
+    );
 
-        // Find the source originally used for extraction.
-        const source = sources.find(
-          (item) => item.id === claimItem.sourceId
-        );
+  const supportedClaims =
+    verifiedClaims.filter(
+      (item) =>
+        item.verification.status ===
+        "supported"
+    );
 
-        verifiedClaims.push({
-          ...claimItem,
+  // One strongly supported claim is enough
+  if (strongClaims.length >= 1) {
+    return {
+      sufficient: true,
+      reason:
+        "At least one claim has strong supporting evidence.",
+    };
+  }
 
-          source: source
-            ? {
-                title: source.title,
-                url: source.url,
-                domain: source.domain,
-                sourceQuality: source.sourceQuality,
-              }
-            : null,
+  // Two supported claims are enough
+  if (supportedClaims.length >= 2) {
+    return {
+      sufficient: true,
+      reason:
+        "Multiple claims have supporting evidence.",
+    };
+  }
 
-          verification: {
-            status: verification.status || "insufficient_evidence",
-            supportingSources:
-              Number(verification.supportingSources) || 0,
-            contradictingSources:
-              Number(verification.contradictingSources) || 0,
-            reason:
-              verification.reason ||
-              "No verification reason provided",
-          },
-        });
-      }
+  // One supported claim
+  if (supportedClaims.length === 1) {
+    const quality =
+      supportedClaims[0]?.source
+        ?.sourceQuality;
 
-      findings.push({
+    if (quality === "high") {
+      return {
+        sufficient: true,
+        reason:
+          "The claim is supported by a high-quality source.",
+      };
+    }
+
+    return {
+      sufficient: false,
+      reason:
+        "Only one claim is supported by a non-high-quality source.",
+    };
+  }
+
+  return {
+    sufficient: false,
+    reason:
+      "Not enough reliable evidence.",
+  };
+}
+
+/* -----------------------------
+   Re-index Sources
+----------------------------- */
+
+function reindexSources(
+  sources
+) {
+  return sources.map(
+    (source, index) => ({
+      ...source,
+      id: index + 1,
+    })
+  );
+}
+
+/* -----------------------------
+   Research One Sub-question
+----------------------------- */
+
+async function researchSubQuestion(
+  subQuestion,
+  initialSources
+) {
+  let sources = reindexSources(
+    processSources(initialSources)
+  );
+
+  let claims =
+    await extractClaims(
+      subQuestion,
+      sources
+    );
+
+  let verifiedClaims = [];
+
+  for (const claimItem of claims) {
+    const verification =
+      await verifyClaim(
         subQuestion,
-        claims: verifiedClaims,
+        claimItem,
+        sources
+      );
+
+    const source =
+      sources.find(
+        (item) =>
+          item.id ===
+          Number(
+            claimItem.sourceId
+          )
+      );
+
+    verifiedClaims.push({
+      ...claimItem,
+
+      source: source
+        ? {
+            title: source.title,
+            url: source.url,
+            domain: source.domain,
+            sourceQuality:
+              source.sourceQuality,
+          }
+        : null,
+
+      verification: {
+        status:
+          verification.status ||
+          "insufficient_evidence",
+
+        supportingSources:
+          Number(
+            verification.supportingSources
+          ) || 0,
+
+        contradictingSources:
+          Number(
+            verification.contradictingSources
+          ) || 0,
+
+        reason:
+          verification.reason ||
+          "No verification reason provided",
+      },
+    });
+  }
+
+  let sufficiency =
+    evaluateSufficiency(
+      verifiedClaims
+    );
+
+  let followUpSearchUsed =
+    false;
+
+  let followUpQuery = "";
+
+  /* -----------------------------
+     One Optional Follow-up Search
+  ----------------------------- */
+
+  if (!sufficiency.sufficient) {
+    const followUpPrompt = `
+Generate ONE focused web search query for this research question.
+
+Question:
+${subQuestion}
+
+Current evidence:
+${verifiedClaims
+  .map(
+    (item) =>
+      `Claim: ${item.claim}
+Status: ${item.verification.status}`
+  )
+  .join("\n")}
+
+Rules:
+- Find stronger or missing evidence.
+- Do not answer the question.
+- Keep query short.
+- Return ONLY JSON.
+
+Required JSON:
+{
+  "query": "search query"
+}
+`;
+
+    const followUpResult =
+      await askOllama(
+        followUpPrompt,
+        50
+      );
+
+    followUpQuery =
+      typeof followUpResult.query ===
+      "string"
+        ? followUpResult.query.trim()
+        : "";
+
+    if (followUpQuery) {
+      console.log(
+        `Follow-up search: ${followUpQuery}`
+      );
+
+      const followUpSources =
+        await searchWeb(
+          followUpQuery
+        );
+
+      const processed =
+        processSources(
+          followUpSources
+        );
+
+      const existingUrls =
+        new Set(
+          sources.map(
+            (source) => source.url
+          )
+        );
+
+      const newSources =
+        processed.filter(
+          (source) =>
+            source.url &&
+            !existingUrls.has(
+              source.url
+            )
+        );
+
+      if (newSources.length > 0) {
+        sources =
+          reindexSources([
+            ...sources,
+            ...newSources,
+          ].slice(0, 5));
+
+        followUpSearchUsed =
+          true;
+
+        // Re-run extraction
+        claims =
+          await extractClaims(
+            subQuestion,
+            sources
+          );
+
+        verifiedClaims = [];
+
+        // Re-run verification
+        for (const claimItem of claims) {
+          const verification =
+            await verifyClaim(
+              subQuestion,
+              claimItem,
+              sources
+            );
+
+          const source =
+            sources.find(
+              (item) =>
+                item.id ===
+                Number(
+                  claimItem.sourceId
+                )
+            );
+
+          verifiedClaims.push({
+            ...claimItem,
+
+            source: source
+              ? {
+                  title: source.title,
+                  url: source.url,
+                  domain: source.domain,
+                  sourceQuality:
+                    source.sourceQuality,
+                }
+              : null,
+
+            verification: {
+              status:
+                verification.status ||
+                "insufficient_evidence",
+
+              supportingSources:
+                Number(
+                  verification.supportingSources
+                ) || 0,
+
+              contradictingSources:
+                Number(
+                  verification.contradictingSources
+                ) || 0,
+
+              reason:
+                verification.reason ||
+                "No verification reason provided",
+            },
+          });
+        }
+
+        sufficiency =
+          evaluateSufficiency(
+            verifiedClaims
+          );
+      }
+    }
+  }
+
+  return {
+    subQuestion,
+    sources,
+    claims: verifiedClaims,
+
+    sufficiency: {
+      sufficient:
+        Boolean(
+          sufficiency.sufficient
+        ),
+
+      reason:
+        sufficiency.reason,
+
+      followUpSearchUsed,
+
+      followUpQuery:
+        followUpSearchUsed
+          ? followUpQuery
+          : "",
+    },
+  };
+}
+
+/* -----------------------------
+   Main Research API
+----------------------------- */
+
+export default async function handler(
+  req,
+  res
+) {
+  if (req.method !== "POST") {
+    return res.status(405).json({
+      error:
+        "Method not allowed",
+    });
+  }
+
+  try {
+    const { question } =
+      req.body;
+
+    if (
+      !question ||
+      !question.trim()
+    ) {
+      return res.status(400).json({
+        error:
+          "Research question is required",
       });
     }
 
-    // ==================================================
-    // 4. FINAL RESPONSE
-    // ==================================================
+    /* -----------------------------
+       Planner
+    ----------------------------- */
+
+    const planningPrompt = `
+You are a research planning system.
+
+User research question:
+${question}
+
+Break this question into 2 to 5 focused research sub-questions.
+
+Rules:
+- Cover important aspects.
+- Each sub-question investigates a different aspect.
+- Keep questions concise.
+- Do not answer.
+- Return ONLY valid JSON.
+
+Required JSON:
+{
+  "subQuestions": [
+    "question 1",
+    "question 2",
+    "question 3"
+  ]
+}
+`;
+
+    const plan =
+      await askOllama(
+        planningPrompt,
+        120
+      );
+
+    const subQuestions =
+      Array.isArray(
+        plan.subQuestions
+      )
+        ? plan.subQuestions
+        : [];
+
+    if (
+      !subQuestions.length
+    ) {
+      return res.status(500).json({
+        error:
+          "Planner returned no sub-questions",
+      });
+    }
+
+    /* -----------------------------
+       Search
+    ----------------------------- */
+
+    const researchResults =
+      [];
+
+    for (
+      const subQuestion of subQuestions
+    ) {
+      if (
+        !subQuestion?.trim()
+      ) {
+        continue;
+      }
+
+      console.log(
+        `Searching: ${subQuestion}`
+      );
+
+      const rawSources =
+        await searchWeb(
+          subQuestion
+        );
+
+      const sources =
+        reindexSources(
+          processSources(
+            rawSources
+          )
+        );
+
+      researchResults.push({
+        subQuestion,
+        sources,
+      });
+    }
+
+    /* -----------------------------
+       Evidence Analysis
+    ----------------------------- */
+
+    const findings = [];
+
+    for (
+      const researchItem of researchResults
+    ) {
+      if (
+        !researchItem.subQuestion ||
+        !researchItem.sources?.length
+      ) {
+        continue;
+      }
+
+      console.log(
+        `Analyzing: ${researchItem.subQuestion}`
+      );
+
+      const result =
+        await researchSubQuestion(
+          researchItem.subQuestion,
+          researchItem.sources
+        );
+
+      findings.push(result);
+    }
 
     return res.status(200).json({
       question,
@@ -427,11 +749,16 @@ Required JSON:
       findings,
     });
   } catch (error) {
-    console.error("Research API error:", error);
+    console.error(
+      "Research API error:",
+      error
+    );
 
     return res.status(500).json({
-      error: "Research pipeline failed",
-      details: error.message,
+      error:
+        "Research pipeline failed",
+      details:
+        error.message,
     });
   }
 }

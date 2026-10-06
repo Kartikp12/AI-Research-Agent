@@ -1,4 +1,5 @@
 import { searchWeb } from "../../lib/search";
+import { processSources } from "../../lib/source-quality";
 
 export default async function handler(req, res) {
   if (req.method !== "POST") {
@@ -110,7 +111,8 @@ Required format:
 
       console.log(`Searching: ${subQuestion}`);
 
-      const sources = await searchWeb(subQuestion.trim());
+      const rawSources = await searchWeb(subQuestion);
+      const sources = processSources(rawSources);
 
       researchResults.push({
         subQuestion,
@@ -119,7 +121,7 @@ Required format:
     }
 
     // ==================================================
-    // 3. CLAIM EXTRACTION + VERIFICATION
+    // 3. CLAIM EXTRACTION + MULTI-SOURCE VERIFICATION
     // ==================================================
 
     const findings = [];
@@ -145,6 +147,8 @@ Required format:
           return `
 SOURCE [${source.id}]
 Title: ${source.title}
+Domain: ${source.domain || ""}
+Quality: ${source.sourceQuality || "medium"}
 
 Content:
 ${source.content?.slice(0, 700) || ""}
@@ -247,30 +251,30 @@ Required JSON:
         : [];
 
       // ------------------------------------------------
-      // Verify claims
+      // Multi-source verification
       // ------------------------------------------------
 
       const verifiedClaims = [];
 
       for (const claimItem of claims) {
-        const source = sources.find(
-          (item) => item.id === claimItem.sourceId
-        );
+        const sourceContextForVerification = sources
+          .slice(0, 3)
+          .map((source, index) => {
+            return `
+SOURCE ${index + 1}
+Source ID: ${source.id}
+Title: ${source.title}
+Domain: ${source.domain || ""}
+Quality: ${source.sourceQuality || "medium"}
 
-        if (!source) {
-          verifiedClaims.push({
-            ...claimItem,
-            verification: {
-              status: "unsupported",
-              reason: "Referenced source was not found",
-            },
-          });
-
-          continue;
-        }
+Content:
+${source.content?.slice(0, 500) || ""}
+`;
+          })
+          .join("\n-----------------\n");
 
         const verificationPrompt = `
-You are an evidence verification system.
+You are a multi-source evidence verification system.
 
 Research sub-question:
 ${subQuestion}
@@ -278,29 +282,45 @@ ${subQuestion}
 Claim:
 ${claimItem.claim}
 
-Evidence:
+Evidence extracted from one source:
 ${claimItem.evidence}
 
-Source content:
-${source.content?.slice(0, 700) || ""}
+Evaluate the claim against ALL provided sources.
 
-Determine whether the source content directly supports the claim.
-
-Allowed status values:
-- supported
-- partially_supported
-- unsupported
+${sourceContextForVerification}
 
 Rules:
-- Use ONLY the provided source content.
+- Use ONLY the provided sources.
 - Do not use outside knowledge.
 - Do not invent information.
-- Keep the reason under 15 words.
+- Count sources that support the claim.
+- Count sources that contradict the claim.
+- A source should count as supporting only if its content provides direct or clear evidence.
+- Do not treat missing information as contradiction.
+- If multiple sources independently support the claim, confidence is stronger.
+- If sources disagree, use conflicting.
+- Keep the reason under 20 words.
 - Return ONLY valid JSON.
+
+Allowed status values:
+- strongly_supported
+- supported
+- partially_supported
+- conflicting
+- insufficient_evidence
+
+Status guidance:
+- strongly_supported: 2 or more sources clearly support the claim and no source contradicts it.
+- supported: 1 source clearly supports the claim and no source contradicts it.
+- partially_supported: evidence supports only part of the claim.
+- conflicting: at least one source supports and another contradicts the claim.
+- insufficient_evidence: sources do not provide enough evidence.
 
 Required JSON:
 {
   "status": "supported",
+  "supportingSources": 1,
+  "contradictingSources": 0,
   "reason": "short explanation"
 }
 `;
@@ -319,7 +339,7 @@ Required JSON:
               format: "json",
               think: false,
               options: {
-                num_predict: 100,
+                num_predict: 120,
               },
             }),
           }
@@ -360,14 +380,29 @@ Required JSON:
           });
         }
 
+        // Find the source originally used for extraction.
+        const source = sources.find(
+          (item) => item.id === claimItem.sourceId
+        );
+
         verifiedClaims.push({
           ...claimItem,
-          source: {
-            title: source.title,
-            url: source.url,
-          },
+
+          source: source
+            ? {
+                title: source.title,
+                url: source.url,
+                domain: source.domain,
+                sourceQuality: source.sourceQuality,
+              }
+            : null,
+
           verification: {
-            status: verification.status || "unsupported",
+            status: verification.status || "insufficient_evidence",
+            supportingSources:
+              Number(verification.supportingSources) || 0,
+            contradictingSources:
+              Number(verification.contradictingSources) || 0,
             reason:
               verification.reason ||
               "No verification reason provided",

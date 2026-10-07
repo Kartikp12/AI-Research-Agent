@@ -18,7 +18,7 @@ async function askOllama(prompt) {
         format: "json",
         think: false,
         options: {
-          num_predict: 350,
+            num_predict: 500,
         },
       }),
     }

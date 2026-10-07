@@ -131,7 +131,7 @@ Required JSON:
 
   const result = await askOllama(
     prompt,
-    150
+    180
   );
 
   return Array.isArray(result.claims)

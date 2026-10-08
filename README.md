@@ -1,4 +1,5 @@
 # AI Research Agent
+![AI Research Agent](screenshots/agentchatinfo.png)
 
 > An AI-powered research agent that searches the web, analyzes evidence, verifies claims, and generates structured, source-grounded research reports.
 
